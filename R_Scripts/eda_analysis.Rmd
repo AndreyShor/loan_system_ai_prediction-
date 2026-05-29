@@ -20,7 +20,7 @@ We start by loading the `cleaned_assignment_data.csv` file that was generated du
 
 ```{r load_data}
 # Read the cleaned data
-data <- read_csv("cleaned_assignment_data.csv", show_col_types = FALSE)
+data <- read_csv("./../Data/cleaned_assignment_data.csv", show_col_types = FALSE)
 
 # Re-coerce categorical variables to factors for proper EDA plotting
 categorical_vars <- c("Variable_5", "Variable_6", "Variable_12", 
