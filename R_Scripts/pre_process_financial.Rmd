@@ -1,0 +1,151 @@
+---
+title: "Financial Model Analysis: Data Loading & Initial Cleaning"
+author: "Andrejs Sorstkins"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+# Load necessary tidyverse packages
+library(tidyverse)
+library(lubridate)
+```
+
+## Data Loading and Initial Cleaning (Detailed Explanation)
+
+First, we load the dataset. As defined in our plan, we will treat `;` as the separator and automatically replace any occurrences of the string `"NULL"` with R's standard `NA` format. 
+
+We use `read_delim()` from the `readr` package (part of `tidyverse`), which is faster and more consistent than base R's `read.csv()`.
+
+```{r data_loading}
+# Load the data, correctly treating "NULL" as missing values
+data <- read_delim("../Data/Assignment_Data.csv", delim = ";", na = c("NULL", "NA", ""), show_col_types = FALSE)
+
+# Take a look at the structure and first few rows
+glimpse(data)
+
+cat("Final Dataset Shape: ", dim(data)[1], "rows, ", dim(data)[2], "columns\n")
+
+```
+
+## Type Coercion
+
+Based on the assignment description, we need to explicitly declare which variables are numerical, categorical/ordinal, and dates. This ensures R treats them correctly in later steps.
+
+### Numeric Variables
+We will explicitly convert `Variable_1` to `Variable_4`, `Variable_7` to `Variable_11`, and `Variable_15` to `Variable_41` to `numeric` type. We do this in-place using `mutate()` and `across()`.
+
+```{r numeric_coercion}
+# Generate a list of numeric column names dynamically to save typing.
+# paste0("Variable_", 1:4) creates c("Variable_1", "Variable_2", "Variable_3", "Variable_4")
+numeric_vars <- c(
+  paste0("Variable_", 1:4),
+  paste0("Variable_", 7:11),
+  paste0("Variable_", 15:41)
+)
+
+# Convert all defined numeric variables to numeric type, overwriting existing columns.
+# - mutate() is used to modify the dataframe.
+# - across() allows us to apply the as.numeric function to all columns specified in numeric_vars.
+# - all_of() ensures we strictly select only the exact names defined in our list.
+data <- data %>%
+  mutate(across(all_of(numeric_vars), as.numeric))
+
+# Verify numeric conversion
+head(data %>% select(all_of(numeric_vars)))
+```
+
+### Categorical and Ordinal Variables
+These variables should be treated as factors (categories) rather than numeric values or raw strings. We convert them in-place.
+
+```{r categorical_coercion}
+# Create a manual list of categorical and ordinal variable names.
+# We explicitly list them because they don't follow a simple sequential pattern like the numerics did.
+categorical_vars <- c("Variable_5", "Variable_6", "Variable_12", 
+                      "Variable_13", "Variable_14", "Variable_45")
+
+# Convert all defined variables to 'factor' type, overwriting existing columns.
+# - mutate() modifies the dataframe.
+# - across() applies the as.factor function to every column listed in categorical_vars.
+# - as.factor() is the R function that converts data into discrete categorical levels.
+data <- data %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+
+# Verify categorical conversion
+head(data %>% select(all_of(categorical_vars)))
+```
+
+### Date Unification
+The dataset contains multiple date fields potentially in different string formats (some with time, some without). We must unify these into standardized `POSIXct` (datetime) objects using the `lubridate` package.
+
+```{r date_unification}
+date_vars <- c("due_date", "first_status_day_date", "first_status_time_of_day", 
+               "paid_date", "arrived_date", "Variable_42", "Variable_43", "Variable_44")
+
+# Look at raw date formats before converting
+head(data %>% select(all_of(date_vars)))
+
+# Apply parsing to all date variables.
+# 1. We use mutate(across(...)) to target all date columns EXCEPT the time-only column.
+# 2. lubridate provides parsing functions. dmy_hms() parses Day-Month-Year Hour:Minute:Second.
+#    dmy() parses Day-Month-Year with no time.
+# 3. coalesce(A, B) is a fallback function. It tries to use A (dmy_hms). If A fails 
+#    and returns NA (because there was no time in the string), it falls back to B (dmy).
+#    This handles mixed date formats robustly!
+data <- data %>%
+  mutate(across(c("due_date", "first_status_day_date", "paid_date", 
+                  "arrived_date", "Variable_42", "Variable_43", "Variable_44"), 
+                ~ coalesce(dmy_hms(., quiet = TRUE), dmy(., quiet = TRUE)))) %>%
+  # Handle the time-only column separately using the hms package
+  mutate(first_status_time_of_day = hms::as_hms(first_status_time_of_day))
+
+# Verify unified dates
+head(data %>% select(all_of(date_vars)))
+```
+
+## Handling Missing Data (Optional Step after EDA)
+
+As discovered in our EDA, some columns are too sparse to be useful, while others have massive gaps where the *missingness itself* is a strong signal. We will apply the "Missingness Flag" lifehack here.
+
+```{r missing_data_handling}
+# 1. Drop useless columns (>92% missing OR Zero-Variance)
+zero_variance_vars <- c("Variable_28", "Variable_3", "Variable_30", 
+                        "Variable_31", "Variable_32", "Variable_33", "Variable_34")
+
+data <- data %>% select(-c(Variable_42, Variable_43, Variable_44), 
+                        -all_of(zero_variance_vars))
+
+# 2. Create missingness flags for moderate/high missing columns
+high_miss_vars <- c("Variable_21", "Variable_38", "Variable_22", "Variable_39", "Variable_20", "Variable_37")
+
+# This creates a new column called 'is_missing_Variable_X' filled with 1s and 0s
+data <- data %>%
+  mutate(across(all_of(high_miss_vars), ~ as.integer(is.na(.)), .names = "is_missing_{.col}"))
+
+# 3. Safe Median Imputation
+# Now we can safely fill the NAs in the original columns with the median
+data <- data %>%
+  mutate(across(all_of(high_miss_vars), ~ replace_na(., median(., na.rm = TRUE))))
+
+# 4. Drop Redundant (Multicollinear) Features
+# We drop these after imputing/flagging to avoid "column not found" errors
+redundant_vars <- c("Variable_11", "Variable_26", "Variable_39", "Variable_38", "Variable_37", "Variable_27")
+data <- data %>% select(-all_of(redundant_vars))
+
+# Verify
+head(data %>% select(starts_with("is_missing_")))
+```
+
+## Export Cleaned Data
+
+Now that the initial data loading and type coercion is complete, we export the cleaned dataset to a new CSV file so it can be used for further analysis or modeled in Python.
+We use `write_csv()` from the `readr` package because it handles dates and factors consistently and is much faster than base R.
+
+```{r save_data}
+# Final Verification
+cat("Final Dataset Shape: ", dim(data)[1], "rows, ", dim(data)[2], "columns\n")
+
+# Save the cleaned dataset for modeling in Python
+write_csv(data, "../Data/cleaned_assignment_data.csv")
+```

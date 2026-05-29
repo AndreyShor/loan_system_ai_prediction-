@@ -1,0 +1,162 @@
+---
+title: "Financial Model Analysis: Exploratory Data Analysis"
+author: "Andrejs Sorstkins"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+# Load necessary libraries
+library(tidyverse)
+library(naniar)
+library(ggplot2)
+library(corrplot)
+```
+
+## Data Loading
+
+We start by loading the `cleaned_assignment_data.csv` file that was generated during the initial data loading and cleaning phase. Because CSV files do not store R's internal data types (like factors), we will quickly re-assign the categorical variables to factors so our plots display correctly.
+
+```{r load_data}
+# Read the cleaned data
+data <- read_csv("cleaned_assignment_data.csv", show_col_types = FALSE)
+
+# Re-coerce categorical variables to factors for proper EDA plotting
+categorical_vars <- c("Variable_5", "Variable_6", "Variable_12", 
+                      "Variable_13", "Variable_14", "Variable_45", "Target")
+
+data <- data %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+
+glimpse(data)
+```
+
+## 1. Target Variable Distribution
+
+First, we analyze the distribution of the `Target` variable to identify if we have a class imbalance. Note that rows 2058 to 2572 do not have a Target value yet (they are the prediction set), so we filter them out.
+
+```{r target_distribution}
+# Filter out rows where Target is NA (the prediction set)
+labeled_data <- data %>% filter(!is.na(Target))
+
+ggplot(labeled_data, aes(x = Target, fill = Target)) +
+  geom_bar() +
+  labs(title = "Distribution of the Target Variable", 
+       subtitle = "Checking for class imbalance",
+       x = "Target", y = "Count") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set1")
+
+# Print exact counts and percentages
+labeled_data %>%
+  count(Target) %>%
+  mutate(Percentage = n / sum(n) * 100)
+```
+
+## 2. Missing Value Analysis
+
+We need to understand patterns of missing data across all features to inform our imputation strategy. We use the `naniar` package for this.
+
+```{r missing_values, fig.height=8, fig.width=10}
+# Visualize the top missing variables
+gg_miss_var(data) + 
+  labs(title = "Missing Values by Variable")
+
+# Calculate exact percentage of missing values for each column
+missing_percentages <- colMeans(is.na(data)) * 100
+missing_df <- data.frame(Variable = names(missing_percentages), 
+                         Missing_Percentage = missing_percentages) %>%
+  filter(Missing_Percentage > 0) %>%
+  arrange(desc(Missing_Percentage))
+
+head(missing_df, 15)
+```
+
+## 3. Numerical Distribution Summary (Univariate Analysis)
+
+Visualizing 36 histograms is inefficient and hides data quality issues (like zero-variance or discrete pseudo-numerics). Instead, we generate a comprehensive statistical summary table.
+
+```{r univariate_numeric}
+# Define a robust skewness function (ignoring NAs)
+calc_skewness <- function(x) {
+  x <- na.omit(x)
+  if (length(x) < 3) return(NA)
+  n <- length(x)
+  (sum((x - mean(x))^3) / n) / (sum((x - mean(x))^2) / n)^(3/2)
+}
+
+# Generate the summary table for all numeric 'Variable_X' columns
+numeric_summary <- labeled_data %>%
+  select(starts_with("Variable") & where(is.numeric)) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  summarise(
+    Unique_Count = n_distinct(Value, na.rm = TRUE),
+    Min = min(Value, na.rm = TRUE),
+    Median = median(Value, na.rm = TRUE),
+    Max = max(Value, na.rm = TRUE),
+    Std_Dev = sd(Value, na.rm = TRUE),
+    Skewness = calc_skewness(Value)
+  ) %>%
+  # Sort by Unique_Count to instantly spot Zero-Variance and discrete variables
+  arrange(Unique_Count)
+
+# Print the top variables
+knitr::kable(head(numeric_summary, 15), digits = 3, caption = "Numerical Summary (Sorted by Unique Values)")
+```
+
+## 4. Correlation & Feature Importance Analysis
+
+Instead of a giant, unreadable 36x36 heatmap, we extract exactly what a data scientist needs to know:
+1. Which features correlate most strongly with the Target?
+2. Are there any features that are perfectly correlated with *each other* (Multicollinearity)?
+
+```{r correlation_matrix, results='asis', warning=FALSE, message=FALSE}
+# Suppress the xfun::attr deprecation warnings
+options(warn=-1)
+# Select numeric variables + the Target
+numeric_data <- labeled_data %>% 
+  select(starts_with("Variable") & where(is.numeric), Target) %>%
+  # Ensure Target is numeric for correlation before calculating SD
+  mutate(Target = as.numeric(as.character(Target))) %>%
+  # Remove zero-variance columns to prevent NA errors during correlation math
+  select(where(~ sd(., na.rm = TRUE) > 0))
+
+# Calculate the full correlation matrix
+cor_matrix <- cor(numeric_data, use = "pairwise.complete.obs")
+
+# 1. Target Correlations
+# This pipeline extracts and sorts the correlations to find the strongest predictors:
+target_cor <- as.data.frame(as.table(cor_matrix[,"Target"])) %>%      # Extract only the Target column and convert to dataframe
+  rename(Feature = Var1, Correlation_with_Target = Freq) %>%          # Rename the default columns to be readable
+  filter(Feature != "Target") %>%                                     # Drop Target vs Target (which is always 1.0)
+  filter(!is.na(Correlation_with_Target)) %>%                         # Drop NAs caused by math errors (e.g., zero variance)
+  mutate(Abs_Corr = abs(Correlation_with_Target)) %>%                 # Calculate Absolute Value (since -0.9 is as strong as 0.9)
+  arrange(desc(Abs_Corr)) %>%                                         # Sort descending by absolute strength
+  select(-Abs_Corr)                                                   # Drop the temporary absolute column from final output
+
+print("### Top 10 Features Correlated with Target\n\n")
+print(knitr::kable(head(target_cor, 10), digits = 3))
+print("\n\n")
+
+# 2. Multicollinearity Check (Features highly correlated with EACH OTHER)
+multi_col_pairs <- as.data.frame(as.table(cor_matrix)) %>%
+  rename(Feature_1 = Var1, Feature_2 = Var2, Correlation = Freq) %>%
+  filter(Feature_1 != Feature_2) %>%
+  filter(!is.na(Correlation)) %>%
+  filter(abs(Correlation) > 0.85) %>%
+  # Remove duplicate pairs (A-B is the same as B-A)
+  mutate(Pair = pmin(as.character(Feature_1), as.character(Feature_2)),
+         Pair2 = pmax(as.character(Feature_1), as.character(Feature_2))) %>%
+  distinct(Pair, Pair2, .keep_all = TRUE) %>%
+  select(Feature_1, Feature_2, Correlation) %>%
+  arrange(desc(abs(Correlation)))
+
+print("### Redundant Features (Correlation > 0.85)\n\n")
+if(nrow(multi_col_pairs) > 0) {
+  print(knitr::kable(multi_col_pairs, digits = 3))
+} else {
+  cat("No highly correlated feature pairs found (No severe multicollinearity).\n")
+}
+```
